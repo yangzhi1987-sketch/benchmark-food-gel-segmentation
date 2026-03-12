@@ -1,1 +1,9 @@
-
+torch
+torchvision
+segmentation-models-pytorch
+numpy
+opencv-python
+scikit-image
+pandas
+matplotlib
+scikit-learn
