@@ -1,1 +1,908 @@
+# ============================================================
+#  MULTI-MODEL SEGMENTATION BENCHMARK (Mac MPS)
+#
+# Install:
+# pip install segmentation-models-pytorch timm albumentations scikit-image scikit-learn pandas tqdm opencv-python
+# ============================================================
+
+import os, json, random
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import List, Tuple, Dict, Optional, Union
+
+import numpy as np
+import pandas as pd
+import cv2
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+import segmentation_models_pytorch as smp
+import albumentations as A
+
+from skimage.measure import label, regionprops, euler_number
+from skimage.morphology import remove_small_objects
+from sklearn.metrics import r2_score
+
+
+# =========================
+# CONFIG (EDIT PATHS HERE)
+# =========================
+@dataclass
+class CFG:
+    # --- TRAIN paths ---
+    train_images_dir: str = "/Users/zhiy/OneDrive/Protein_Gel_AI_Project/confocal_dataset/train/resized_images"
+    train_masks_dir:  str = "/Users/zhiy/OneDrive/Protein_Gel_AI_Project/confocal_dataset/train/resized_masks"
+
+    # --- TEST paths ---
+    test_images_dir: str = "/Users/zhiy/OneDrive/Protein_Gel_AI_Project/confocal_dataset/test/resized_images1230"
+    test_masks_dir:  str = "/Users/zhiy/OneDrive/Protein_Gel_AI_Project/confocal_dataset/test/resized_masks1230"
+
+    # --- Output root ---
+    output_root: str = "/Users/zhiy/OneDrive/Protein_Gel_AI_Project/runs_mps_pub_benchmark0125"
+
+    # --- filename rules (your naming) ---
+    # train: gel_01.jpg -> gel_01_fiji_mask.png  (stem + "_fiji_mask")
+    train_mask_suffix: str = "_fiji_mask"
+    # test: gel01_test.jpg -> gel01_test_test_mask.png  (stem + "_test_mask")
+    test_mask_suffix:  str = "_test_mask"
+
+    # --- Data & training ---
+    patch: int = 512
+    overlap: int = 64
+    n_patches_per_image: int = 6
+
+    batch_size: int = 4
+    epochs: int = 100
+    lr: float = 2e-4
+    weight_decay: float = 1e-4
+
+    threshold: float = 0.5
+    val_fraction: float = 0.15
+    seed: int = 42
+
+    # Mac stability
+    num_workers: int = 0
+    device: str = "mps"  # "mps" or "cpu"
+
+    # Figures
+    dpi: int = 300
+    # ⚠️ If True, will display EVERY 3-panel + EVERY scatter/BA plot in notebook (can be A LOT)
+    show_all_panels_in_notebook: bool = True
+    show_all_plots_in_notebook: bool = True
+
+    # Protein aggregation area (white/protein phase)
+    min_agg_area_px: int = 50          # drop tiny specks
+    agg_cleanup_remove_small: bool = True
+
+    # FD scales (NO small noisy boxes)
+    fd_scales: tuple = (8, 12, 16, 24, 32, 48, 64)
+
+    # Lacunarity
+    lac_box: int = 16
+    lac_stride: Optional[int] = None   # default box/4
+
+
+PathLike = Union[str, Path]
+IMG_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+
+
+# =========================
+# BASIC UTILS
+# =========================
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+def ensure_dir(p: PathLike):
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+def read_gray(path: PathLike) -> np.ndarray:
+    im = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if im is None:
+        raise FileNotFoundError(path)
+    return im
+
+def norm01(x: np.ndarray) -> np.ndarray:
+    x = x.astype(np.float32)
+    if x.max() > 1.0:
+        x /= 255.0
+    return x
+
+def get_device(cfg: CFG):
+    if cfg.device == "mps" and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+def _maybe_show():
+    # helper: keep display controllable
+    plt.show()
+
+def _show_and_close(cfg: CFG, fig=None):
+    if fig is None:
+        fig = plt.gcf()
+    if cfg.show_all_plots_in_notebook:
+        _maybe_show()
+    plt.close(fig)
+
+
+# =========================
+# PAIRING (filters hidden files like .DS_Store)
+# =========================
+def _list_valid_files(d: PathLike, exts=IMG_EXTS) -> List[Path]:
+    d = Path(d)
+    files = []
+    for p in d.iterdir():
+        if not p.is_file():
+            continue
+        if p.name.startswith("."):
+            continue
+        if p.suffix.lower() not in exts:
+            continue
+        files.append(p)
+    return sorted(files)
+
+def build_pairs_exact(img_dir: str, mask_dir: str, mask_suffix: str,
+                      prefer_exts=(".png", ".tif", ".tiff", ".jpg", ".jpeg")) -> Tuple[List[Tuple[str,str]], pd.DataFrame]:
+    img_files = _list_valid_files(img_dir)
+    mask_files = _list_valid_files(mask_dir)
+
+    masks_by_stem: Dict[str, List[Path]] = {}
+    for m in mask_files:
+        masks_by_stem.setdefault(m.stem, []).append(m)
+
+    rows = []
+    pairs: List[Tuple[str,str]] = []
+
+    for im in img_files:
+        stem = im.stem
+        expected = f"{stem}{mask_suffix}"
+        candidates = masks_by_stem.get(expected, [])
+
+        status = "OK"
+        chosen = None
+
+        if len(candidates) == 0:
+            status = "MISSING_MASK"
+        else:
+            cand_sorted = sorted(
+                candidates,
+                key=lambda p: (prefer_exts.index(p.suffix.lower()) if p.suffix.lower() in prefer_exts else 999, str(p))
+            )
+            chosen = cand_sorted[0]
+            if len(candidates) > 1:
+                status = f"DUPLICATE_MASKS({len(candidates)})"
+
+        rows.append({
+            "image": str(im),
+            "image_stem": stem,
+            "expected_mask_stem": expected,
+            "mask_chosen": str(chosen) if chosen is not None else "",
+            "n_mask_candidates_exact": len(candidates),
+            "status": status
+        })
+
+        if chosen is not None:
+            pairs.append((str(im), str(chosen)))
+
+    report = pd.DataFrame(rows)
+    return pairs, report
+
+def split_train_val(pairs: List[Tuple[str,str]], val_fraction: float, seed: int):
+    pairs = pairs.copy()
+    rnd = random.Random(seed)
+    rnd.shuffle(pairs)
+    n_val = max(1, int(len(pairs) * val_fraction))
+    return pairs[n_val:], pairs[:n_val]
+
+
+# =========================
+# AUGMENTATION (ALBUMENTATIONS)
+# =========================
+def get_train_aug():
+    return A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.RandomRotate90(p=0.5),
+        A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.12, rotate_limit=15,
+                           border_mode=cv2.BORDER_REFLECT, p=0.5),
+        A.RandomBrightnessContrast(p=0.35),
+        A.GaussNoise(var_limit=(5.0, 25.0), p=0.25),
+        A.RandomGamma(p=0.25),
+    ])
+
+def get_val_aug():
+    return A.Compose([])
+
+
+# =========================
+# DATASETS
+# =========================
+class PatchDataset(Dataset):
+    def __init__(self, pairs: List[Tuple[str,str]], patch: int, n_patches_per_image: int,
+                 aug: Optional[A.Compose] = None, oversample_fg: float = 0.7):
+        self.pairs = pairs
+        self.patch = patch
+        self.n_patches = n_patches_per_image
+        self.aug = aug
+        self.oversample_fg = oversample_fg
+
+    def __len__(self):
+        return len(self.pairs) * self.n_patches
+
+    def __getitem__(self, idx):
+        im_path, mk_path = self.pairs[idx // self.n_patches]
+
+        img = norm01(read_gray(im_path))
+        # protein=1 (white), void=0
+        msk = (read_gray(mk_path) > 127).astype(np.uint8)
+
+        H, W = img.shape
+        p = self.patch
+
+        if H < p or W < p:
+            pad_h = max(0, p - H)
+            pad_w = max(0, p - W)
+            img = np.pad(img, ((0, pad_h), (0, pad_w)), mode="reflect")
+            msk = np.pad(msk, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=0)
+            H, W = img.shape
+
+        for _ in range(10):
+            y = random.randint(0, H - p)
+            x = random.randint(0, W - p)
+            pm = msk[y:y+p, x:x+p]
+            if random.random() > self.oversample_fg or pm.mean() > 0.02:
+                break
+
+        imgp = img[y:y+p, x:x+p]
+        mskp = msk[y:y+p, x:x+p]
+
+        if self.aug is not None:
+            out = self.aug(image=(imgp*255).astype(np.uint8), mask=mskp.astype(np.uint8))
+            imgp = out["image"].astype(np.float32) / 255.0
+            mskp = out["mask"].astype(np.float32)
+
+        img_t = torch.from_numpy(imgp).unsqueeze(0).float()
+        msk_t = torch.from_numpy(mskp).unsqueeze(0).float()
+        return img_t, msk_t
+
+
+class FullImageDataset(Dataset):
+    def __init__(self, pairs: List[Tuple[str,str]]):
+        self.pairs = pairs
+    def __len__(self):
+        return len(self.pairs)
+    def __getitem__(self, idx):
+        ip, mp = self.pairs[idx]
+        img = norm01(read_gray(ip))
+        gt = (read_gray(mp) > 127).astype(np.uint8)  # protein=1
+        return ip, img, gt
+
+
+# =========================
+# STRUCTURAL METRICS
+# =========================
+def fractal_dimension_boxcount(mask: np.ndarray, scales: Tuple[int, ...]) -> float:
+    """
+    Box-count FD using ONLY provided scales (e.g., 8,16,32,64,128).
+    Count N(s) = number of boxes with ANY foreground.
+    Fit: log(N) vs log(1/s) slope -> FD
+    """
+    Z = (mask > 0).astype(np.uint8)
+    H, W = Z.shape
+    max_s = min(H, W)
+    ss = [s for s in scales if 2 <= s <= max_s]
+    ss = sorted(list(set(ss)))
+    if len(ss) < 2:
+        return float("nan")
+
+    Ns = []
+    Ss = []
+    for s in ss:
+        Hc = (H // s) * s
+        Wc = (W // s) * s
+        if Hc == 0 or Wc == 0:
+            continue
+        Zc = Z[:Hc, :Wc]
+        # reshape into blocks (Hc/s, s, Wc/s, s)
+        blocks = Zc.reshape(Hc//s, s, Wc//s, s)
+        block_sum = blocks.sum(axis=(1,3))
+        n = int(np.count_nonzero(block_sum > 0))
+        if n > 0:
+            Ns.append(n)
+            Ss.append(s)
+
+    if len(Ns) < 2:
+        return float("nan")
+
+    x = np.log(1.0 / np.array(Ss, dtype=np.float64))
+    y = np.log(np.array(Ns, dtype=np.float64))
+    a, _b = np.polyfit(x, y, 1)
+    return float(a)
+
+def lacunarity_gliding_box(mask: np.ndarray, box: int = 16, stride: Optional[int] = None) -> float:
+    Z = (mask > 0).astype(np.uint8)
+    h, w = Z.shape
+    if h < box or w < box:
+        return float("nan")
+    if stride is None:
+        stride = max(1, box // 4)
+
+    ii = cv2.integral(Z)
+    sums = []
+    for y in range(0, h - box + 1, stride):
+        y2 = y + box
+        for x in range(0, w - box + 1, stride):
+            x2 = x + box
+            s = ii[y2, x2] - ii[y, x2] - ii[y2, x] + ii[y, x]
+            sums.append(s)
+
+    sums = np.array(sums, dtype=np.float32)
+    if sums.size < 10:
+        return float("nan")
+    mu = float(sums.mean())
+    if mu <= 1e-6:
+        return float("nan")
+    var = float(sums.var())
+    return float(var / (mu * mu) + 1.0)
+
+def betti_numbers_2d(mask: np.ndarray, connectivity: int = 2) -> Tuple[float, float]:
+    fg = (mask > 0).astype(np.uint8)
+    lab_fg = label(fg, connectivity=connectivity)
+    b0 = int(lab_fg.max())
+
+    bg = (1 - fg).astype(np.uint8)
+    lab_bg = label(bg, connectivity=connectivity)
+    n_bg = int(lab_bg.max())
+    if n_bg == 0:
+        return float(b0), 0.0
+
+    border_labels = set(np.unique(lab_bg[0, :]).tolist()
+                        + np.unique(lab_bg[-1, :]).tolist()
+                        + np.unique(lab_bg[:, 0]).tolist()
+                        + np.unique(lab_bg[:, -1]).tolist())
+    border_labels.discard(0)
+    holes = max(0, n_bg - len(border_labels))
+    return float(b0), float(holes)
+
+def protein_aggregation_area_mean(mask: np.ndarray, min_area: int, cleanup_remove_small: bool) -> float:
+    """
+    Protein aggregation area = mean area of connected protein components (protein=1).
+    We optionally remove small objects first to avoid tiny specks.
+    """
+    fg = (mask > 0)
+    if cleanup_remove_small:
+        fg = remove_small_objects(fg, min_size=min_area)
+
+    lab = label(fg.astype(np.uint8), connectivity=2)
+    props = regionprops(lab)
+    areas = [p.area for p in props if p.area >= min_area]
+    if len(areas) == 0:
+        return float("nan")
+    return float(np.mean(np.array(areas, dtype=np.float32)))
+
+def protein_area_fraction(mask: np.ndarray) -> float:
+    fg = (mask > 0).astype(np.uint8)
+    return float(fg.mean())
+
+def compute_descriptors(cfg: CFG, mask: np.ndarray) -> Dict[str, float]:
+    fg = (mask > 0).astype(np.uint8)
+    out = {}
+    out["protein_area_frac"] = protein_area_fraction(fg)
+    out["agg_area_mean"] = protein_aggregation_area_mean(
+        fg, min_area=cfg.min_agg_area_px, cleanup_remove_small=cfg.agg_cleanup_remove_small
+    )
+    out["fd"] = fractal_dimension_boxcount(fg, cfg.fd_scales)
+    out["lac"] = lacunarity_gliding_box(fg, box=cfg.lac_box, stride=cfg.lac_stride)
+    out["euler"] = float(euler_number(fg, connectivity=2))
+    b0, b1 = betti_numbers_2d(fg, connectivity=2)
+    out["betti0"] = b0
+    out["betti1"] = b1
+    return out
+
+
+# =========================
+# PLOTS (SAVE + SHOW)
+# =========================
+def plot_loss_curves(cfg: CFG, hist_df: pd.DataFrame, save_path: PathLike, title: str):
+    plt.figure(figsize=(7,4))
+    plt.plot(hist_df["epoch"], hist_df["train_loss"], label="train loss")
+    plt.plot(hist_df["epoch"], hist_df["val_loss"], label="val loss")
+    plt.plot(hist_df["epoch"], hist_df["val_dice"], label="val dice")
+    plt.plot(hist_df["epoch"], hist_df["val_iou"], label="val iou")
+    plt.xlabel("epoch")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(str(save_path), dpi=cfg.dpi)
+    _show_and_close(cfg)
+
+def three_panel_figure(cfg: CFG, img: np.ndarray, gt: np.ndarray, pr: np.ndarray,
+                       title: str, save_path: PathLike):
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 3, 1); plt.imshow(img, cmap="gray"); plt.title("Original"); plt.axis("off")
+    plt.subplot(1, 3, 2); plt.imshow(gt, cmap="gray");  plt.title("GT");       plt.axis("off")
+    plt.subplot(1, 3, 3); plt.imshow(pr, cmap="gray");  plt.title("AI Pred");  plt.axis("off")
+    plt.suptitle(title)
+    plt.tight_layout()
+    plt.savefig(str(save_path), dpi=cfg.dpi)
+    if cfg.show_all_panels_in_notebook:
+        _maybe_show()
+    plt.close()
+
+def scatter_plot_with_fit(cfg: CFG, gt: np.ndarray, pr: np.ndarray, title: str, save_path: PathLike):
+    gt = gt.astype(np.float64); pr = pr.astype(np.float64)
+    ok = np.isfinite(gt) & np.isfinite(pr)
+    if ok.sum() < 3:
+        return None
+
+    x = gt[ok]
+    y = pr[ok]
+
+    a, b = np.polyfit(x, y, 1)  # y = a x + b
+    y_fit = a * x + b
+
+    r2_pred = float(r2_score(x, y))          # identity fidelity GT vs Pred
+    r2_fit  = float(r2_score(y, y_fit))      # fit quality
+    r = float(np.corrcoef(x, y)[0, 1])
+    r2_pear = float(r * r)
+
+    mn = float(min(x.min(), y.min()))
+    mx = float(max(x.max(), y.max()))
+    xx = np.linspace(mn, mx, 200)
+    yy = a * xx + b
+
+    plt.figure(figsize=(6,5))
+    plt.scatter(x, y, s=20)
+    plt.plot([mn, mx], [mn, mx], label="y=x")
+    plt.plot(xx, yy, label=f"y={a:.3f}x+{b:.3f}")
+    plt.title(f"{title}\nR²_pred={r2_pred:.3f} | R²_fit={r2_fit:.3f} | r²={r2_pear:.3f}")
+    plt.xlabel("GT"); plt.ylabel("Pred")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(str(save_path), dpi=cfg.dpi)
+    _show_and_close(cfg)
+
+    return {"a": float(a), "b": float(b), "r2_pred": r2_pred, "r2_fit": r2_fit, "r2_pear": r2_pear, "n": int(ok.sum())}
+
+def bland_altman_plot(cfg: CFG, gt: np.ndarray, pr: np.ndarray, title: str, save_path: PathLike):
+    gt = gt.astype(np.float64); pr = pr.astype(np.float64)
+    ok = np.isfinite(gt) & np.isfinite(pr)
+    if ok.sum() < 3:
+        return None
+
+    m = (gt[ok] + pr[ok]) / 2.0
+    d = (pr[ok] - gt[ok])
+
+    bias = float(np.mean(d))
+    sd = float(np.std(d, ddof=1)) if d.size > 1 else 0.0
+    loa1 = bias - 1.96 * sd
+    loa2 = bias + 1.96 * sd
+
+    plt.figure(figsize=(6,5))
+    plt.scatter(m, d, s=20)
+    plt.axhline(bias, linestyle="--", label="bias")
+    plt.axhline(loa1, linestyle="--", label="LoA")
+    plt.axhline(loa2, linestyle="--")
+    plt.title(f"{title}\nBias={bias:.3g}, LoA=[{loa1:.3g}, {loa2:.3g}]")
+    plt.xlabel("Mean(GT, Pred)"); plt.ylabel("Pred - GT")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(str(save_path), dpi=cfg.dpi)
+    _show_and_close(cfg)
+
+    return {"bias": bias, "sd": sd, "loa_low": loa1, "loa_high": loa2, "n": int(ok.sum())}
+
+
+# =========================
+# LOSS + SEG METRICS
+# =========================
+def dice_loss_with_logits(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    probs = torch.sigmoid(logits)
+    num = 2.0 * (probs * targets).sum(dim=(2, 3))
+    den = (probs + targets).sum(dim=(2, 3)) + eps
+    return 1.0 - (num / den).mean()
+
+def dice_score_bin(pred: np.ndarray, gt: np.ndarray) -> float:
+    pred = (pred > 0).astype(np.uint8)
+    gt = (gt > 0).astype(np.uint8)
+    inter = int((pred & gt).sum())
+    den = int(pred.sum() + gt.sum()) + 1
+    return float(2.0 * inter / den)
+
+def iou_score_bin(pred: np.ndarray, gt: np.ndarray) -> float:
+    pred = (pred > 0).astype(np.uint8)
+    gt = (gt > 0).astype(np.uint8)
+    inter = int((pred & gt).sum())
+    union = int((pred | gt).sum()) + 1
+    return float(inter / union)
+
+
+# =========================
+# SLIDING WINDOW INFERENCE
+# =========================
+@torch.no_grad()
+def predict_full_prob(model: nn.Module, img: np.ndarray, device: torch.device,
+                      patch: int, overlap: int) -> np.ndarray:
+    model.eval()
+    H, W = img.shape
+    step = max(1, patch - overlap)
+
+    prob = np.zeros((H, W), np.float32)
+    cnt  = np.zeros((H, W), np.float32)
+
+    for y in range(0, H, step):
+        for x in range(0, W, step):
+            y1 = min(y, max(0, H - patch)) if H >= patch else 0
+            x1 = min(x, max(0, W - patch)) if W >= patch else 0
+
+            crop = img[y1:y1+patch, x1:x1+patch]
+            if crop.shape[0] != patch or crop.shape[1] != patch:
+                crop = cv2.copyMakeBorder(
+                    crop,
+                    0, patch - crop.shape[0],
+                    0, patch - crop.shape[1],
+                    borderType=cv2.BORDER_REFLECT
+                )
+
+            ten = torch.from_numpy(crop).unsqueeze(0).unsqueeze(0).float().to(device)
+            logits = model(ten)
+            p = torch.sigmoid(logits).squeeze().detach().cpu().numpy()
+
+            hh = min(patch, H - y1)
+            ww = min(patch, W - x1)
+            prob[y1:y1+hh, x1:x1+ww] += p[:hh, :ww]
+            cnt[y1:y1+hh, x1:x1+ww] += 1.0
+
+    return prob / np.maximum(cnt, 1e-6)
+
+
+# =========================
+# MODEL SUITE (MPS-FEASIBLE)
+# =========================
+def build_model(spec: Dict) -> nn.Module:
+    arch = spec["arch"]
+    encoder = spec["encoder"]
+    attn = spec.get("decoder_attention_type", None)
+
+    kwargs = dict(
+        encoder_name=encoder,
+        encoder_weights="imagenet",
+        in_channels=1,
+        classes=1
+    )
+    if arch in ["Unet", "UnetPlusPlus"] and attn is not None:
+        kwargs["decoder_attention_type"] = attn
+
+    if not hasattr(smp, arch):
+        raise ValueError(f"SMP arch not available in your version: {arch} (model={spec['name']})")
+
+    return getattr(smp, arch)(**kwargs)
+
+def get_model_suite_mps() -> List[Dict]:
+    return [
+        {"name":"BASE_Unet_resnet34", "arch":"Unet", "encoder":"resnet34"},
+
+        {"name":"Unet_resnet34_scse", "arch":"Unet", "encoder":"resnet34", "decoder_attention_type":"scse"},
+        {"name":"Unetpp_resnet34_scse", "arch":"UnetPlusPlus", "encoder":"resnet34", "decoder_attention_type":"scse"},
+
+        {"name":"Unet_effnet_b0", "arch":"Unet", "encoder":"efficientnet-b0"},
+        {"name":"Unet_effnetv2_s", "arch":"Unet", "encoder":"timm-efficientnetv2_s"},
+        {"name":"Unet_convnext_tiny", "arch":"Unet", "encoder":"timm-convnext_tiny"},
+        {"name":"Unetpp_convnext_tiny", "arch":"UnetPlusPlus", "encoder":"timm-convnext_tiny"},
+
+        {"name":"FPN_resnet34", "arch":"FPN", "encoder":"resnet34"},
+        {"name":"FPN_convnext_tiny", "arch":"FPN", "encoder":"timm-convnext_tiny"},
+        {"name":"Linknet_resnet34", "arch":"Linknet", "encoder":"resnet34"},
+        {"name":"MAnet_resnet34", "arch":"MAnet", "encoder":"resnet34"},
+
+        {"name":"DLV3p_resnet50", "arch":"DeepLabV3Plus", "encoder":"resnet50"},
+        {"name":"PSPNet_resnet50", "arch":"PSPNet", "encoder":"resnet50"},
+
+        # optional
+        {"name":"UPerNet_convnext_tiny", "arch":"UPerNet", "encoder":"timm-convnext_tiny"},
+    ]
+
+
+# =========================
+# TRAIN + EVAL ONE MODEL
+# =========================
+def train_and_evaluate_one(cfg: CFG, spec: Dict,
+                           train_pairs: List[Tuple[str,str]],
+                           val_pairs: List[Tuple[str,str]],
+                           test_pairs: List[Tuple[str,str]],
+                           aug_train: A.Compose,
+                           aug_val: A.Compose) -> Dict[str, float]:
+    device = get_device(cfg)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"{spec['name']}__{ts}"
+    out_dir = Path(cfg.output_root) / run_name
+
+    ensure_dir(out_dir)
+    ensure_dir(out_dir / "checkpoints")
+    ensure_dir(out_dir / "figs_train")
+    ensure_dir(out_dir / "figs_test")
+    ensure_dir(out_dir / "pred_masks")
+    ensure_dir(out_dir / "panel_all")          # ALL three-panels
+
+    with open(out_dir / "run_config.json", "w") as f:
+        json.dump({"cfg": asdict(cfg), "model_spec": spec}, f, indent=2)
+
+    ds_tr = PatchDataset(train_pairs, patch=cfg.patch, n_patches_per_image=cfg.n_patches_per_image, aug=aug_train)
+    ds_va = PatchDataset(val_pairs, patch=cfg.patch, n_patches_per_image=max(2, cfg.n_patches_per_image // 2), aug=aug_val)
+    dl_tr = DataLoader(ds_tr, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers)
+    dl_va = DataLoader(ds_va, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
+
+    model = build_model(spec).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    bce = nn.BCEWithLogitsLoss()
+
+    best_va_dice = -1.0
+    best_epoch = -1
+
+    history_rows = []
+
+    for epoch in range(1, cfg.epochs + 1):
+        model.train()
+        tr_losses = []
+        for x, y in tqdm(dl_tr, desc=f"[{spec['name']}] epoch {epoch}/{cfg.epochs} train"):
+            x, y = x.to(device), y.to(device)
+            opt.zero_grad(set_to_none=True)
+            logits = model(x)
+            loss = bce(logits, y) + dice_loss_with_logits(logits, y)
+            loss.backward()
+            opt.step()
+            tr_losses.append(loss.item())
+
+        model.eval()
+        va_losses = []
+        va_dices = []
+        va_ious = []
+        with torch.no_grad():
+            for x, y in tqdm(dl_va, desc=f"[{spec['name']}] epoch {epoch}/{cfg.epochs} val"):
+                x, y = x.to(device), y.to(device)
+                logits = model(x)
+                loss = bce(logits, y) + dice_loss_with_logits(logits, y)
+                va_losses.append(loss.item())
+
+                # quick validation dice/iou on patches
+                probs = torch.sigmoid(logits)
+                pred = (probs > cfg.threshold).float()
+                inter = (pred * y).sum(dim=(2,3))
+                den = (pred.sum(dim=(2,3)) + y.sum(dim=(2,3)) + 1e-6)
+                dice = (2*inter / den).mean().item()
+                union = (pred + y - pred*y).sum(dim=(2,3)) + 1e-6
+                iou = (inter / union).mean().item()
+                va_dices.append(dice)
+                va_ious.append(iou)
+
+        tr_loss = float(np.mean(tr_losses))
+        va_loss = float(np.mean(va_losses))
+        va_dice = float(np.mean(va_dices))
+        va_iou  = float(np.mean(va_ious))
+
+        history_rows.append({
+            "epoch": epoch,
+            "train_loss": tr_loss,
+            "val_loss": va_loss,
+            "val_dice": va_dice,
+            "val_iou": va_iou,
+            "lr": float(opt.param_groups[0]["lr"]),
+        })
+
+        hist_df = pd.DataFrame(history_rows)
+        hist_df.to_csv(out_dir / "figs_train" / "training_history.csv", index=False)  # ✅ save CSV
+        plot_loss_curves(cfg, hist_df, out_dir / "figs_train" / "loss_curve.png", title=spec["name"])
+
+        print(f"[{spec['name']}] Epoch {epoch}: tr_loss={tr_loss:.4f} va_loss={va_loss:.4f} va_dice={va_dice:.4f} va_iou={va_iou:.4f}")
+
+        if va_dice > best_va_dice:
+            best_va_dice = va_dice
+            best_epoch = epoch
+            torch.save({"model": model.state_dict(), "epoch": epoch, "best_va_dice": best_va_dice},
+                       out_dir / "checkpoints" / "best.pt")
+
+    # Load best
+    ckpt = torch.load(out_dir / "checkpoints" / "best.pt", map_location="cpu")
+    model.load_state_dict(ckpt["model"], strict=True)
+    model.to(device)
+    model.eval()
+
+    # TEST full images
+    ds_test = FullImageDataset(test_pairs)
+
+    metric_list = ["protein_area_frac", "agg_area_mean", "fd", "lac", "euler", "betti0", "betti1"]
+    rows = []
+
+    for i in tqdm(range(len(ds_test)), desc=f"[{spec['name']}] test full"):
+        path, img, gt = ds_test[i]
+        prob = predict_full_prob(model, img, device, patch=cfg.patch, overlap=cfg.overlap)
+        pr = (prob > cfg.threshold).astype(np.uint8)
+
+        stem = Path(path).stem
+
+        # Save predicted mask
+        cv2.imwrite(str(out_dir / "pred_masks" / f"{stem}_pred.png"), (pr * 255).astype(np.uint8))
+
+        # Save + show 3-panel for ALL
+        title = f"{spec['name']} | {Path(path).name}"
+        three_panel_figure(cfg, img, gt, pr, title, out_dir / "panel_all" / f"{stem}_img_gt_pred.png")
+
+        # Seg metrics
+        dice = dice_score_bin(pr, gt)
+        iou = iou_score_bin(pr, gt)
+
+        # Descriptors
+        d_gt = compute_descriptors(cfg, gt)
+        d_pr = compute_descriptors(cfg, pr)
+
+        row = {"image": path, "dice": dice, "iou": iou}
+        for k in metric_list:
+            row[f"gt_{k}"] = d_gt[k]
+            row[f"pr_{k}"] = d_pr[k]
+        rows.append(row)
+
+    df_res = pd.DataFrame(rows)
+    df_res.to_csv(out_dir / "test_results.csv", index=False)
+
+    # Descriptor plots (scatter + BA) for ALL descriptors with y=x, y=ax+b, R²
+    summary = {
+        "name": spec["name"],
+        "arch": spec["arch"],
+        "encoder": spec["encoder"],
+        "best_val_dice": float(best_va_dice),
+        "best_epoch": int(best_epoch),
+        "test_dice_mean": float(np.nanmean(df_res["dice"].values)),
+        "test_iou_mean": float(np.nanmean(df_res["iou"].values)),
+    }
+
+    for m in metric_list:
+        gt_arr = df_res[f"gt_{m}"].values
+        pr_arr = df_res[f"pr_{m}"].values
+
+        stats = scatter_plot_with_fit(
+            cfg, gt_arr, pr_arr,
+            title=f"{spec['name']} | {m}: Pred vs GT",
+            save_path=out_dir / "figs_test" / f"scatter_{m}.png",
+        )
+        ba = bland_altman_plot(
+            cfg, gt_arr, pr_arr,
+            title=f"{spec['name']} | {m}: Bland–Altman",
+            save_path=out_dir / "figs_test" / f"ba_{m}.png",
+        )
+
+        if stats is not None:
+            summary[f"{m}_slope_a"] = stats["a"]
+            summary[f"{m}_intercept_b"] = stats["b"]
+            summary[f"{m}_r2_pred"] = stats["r2_pred"]
+            summary[f"{m}_r2_fit"] = stats["r2_fit"]
+            summary[f"{m}_r2_pear"] = stats["r2_pear"]
+        else:
+            summary[f"{m}_slope_a"] = np.nan
+            summary[f"{m}_intercept_b"] = np.nan
+            summary[f"{m}_r2_pred"] = np.nan
+            summary[f"{m}_r2_fit"] = np.nan
+            summary[f"{m}_r2_pear"] = np.nan
+
+        if ba is not None:
+            summary[f"{m}_bias"] = ba["bias"]
+            summary[f"{m}_loa_low"] = ba["loa_low"]
+            summary[f"{m}_loa_high"] = ba["loa_high"]
+        else:
+            summary[f"{m}_bias"] = np.nan
+            summary[f"{m}_loa_low"] = np.nan
+            summary[f"{m}_loa_high"] = np.nan
+
+    with open(out_dir / "test_summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print("Saved run folder:", out_dir)
+    return summary
+
+
+# =========================
+# CROSS-MODEL SUMMARY PLOTS
+# =========================
+def plot_model_summary(cfg: CFG, leaderboard: pd.DataFrame, out_dir: Path):
+    ensure_dir(out_dir)
+
+    # Sort by Dice
+    ld = leaderboard.copy()
+    ld = ld.sort_values("test_dice_mean", ascending=False)
+
+    # Dice/IoU bar
+    plt.figure(figsize=(10, 5))
+    plt.bar(ld["name"], ld["test_dice_mean"], label="Dice")
+    plt.bar(ld["name"], ld["test_iou_mean"], label="IoU", alpha=0.7)
+    plt.xticks(rotation=45, ha="right")
+    plt.ylabel("Score")
+    plt.title("Model summary: Dice & IoU (Test)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_dir / "summary_dice_iou.png", dpi=cfg.dpi)
+    _show_and_close(cfg)
+
+    # Descriptor R²_pred bar plots
+    metric_list = ["protein_area_frac", "agg_area_mean", "fd", "lac", "euler", "betti0", "betti1"]
+    for m in metric_list:
+        col = f"{m}_r2_pred"
+        if col not in ld.columns:
+            continue
+        plt.figure(figsize=(10, 4))
+        plt.bar(ld["name"], ld[col])
+        plt.xticks(rotation=45, ha="right")
+        plt.ylabel("R²_pred (GT vs Pred)")
+        plt.title(f"Model summary: {m} (R²_pred)")
+        plt.tight_layout()
+        plt.savefig(out_dir / f"summary_r2pred_{m}.png", dpi=cfg.dpi)
+        _show_and_close(cfg)
+
+
+# =========================
+# MAIN
+# =========================
+def main():
+    cfg = CFG()
+    seed_everything(cfg.seed)
+    ensure_dir(cfg.output_root)
+
+    # Pairing reports
+    train_pairs, train_report = build_pairs_exact(cfg.train_images_dir, cfg.train_masks_dir, cfg.train_mask_suffix)
+    test_pairs,  test_report  = build_pairs_exact(cfg.test_images_dir,  cfg.test_masks_dir,  cfg.test_mask_suffix)
+
+    pairing_dir = Path(cfg.output_root) / "_pairing_reports"
+    ensure_dir(pairing_dir)
+    train_report.to_csv(pairing_dir / "pairing_train_report.csv", index=False)
+    test_report.to_csv(pairing_dir / "pairing_test_report.csv", index=False)
+
+    print("Pairing summary (train):")
+    print(train_report["status"].value_counts())
+    print("Pairing summary (test):")
+    print(test_report["status"].value_counts())
+
+    # Keep only OK pairs
+    train_pairs_ok = [(r["image"], r["mask_chosen"]) for _, r in train_report.iterrows() if r["status"].startswith("OK")]
+    test_pairs_ok  = [(r["image"], r["mask_chosen"]) for _, r in test_report.iterrows()  if r["status"].startswith("OK")]
+
+    # Split train/val
+    train_pairs_ok, val_pairs_ok = split_train_val(train_pairs_ok, cfg.val_fraction, cfg.seed)
+    print(f"Train pairs: {len(train_pairs_ok)} | Val pairs: {len(val_pairs_ok)} | Test pairs: {len(test_pairs_ok)}")
+
+    # Augmentations
+    aug_train = get_train_aug()
+    aug_val = get_val_aug()
+
+    # Model suite
+    suite = get_model_suite_mps()
+
+    all_summaries = []
+    for spec in suite:
+        try:
+            print(f"\n=== Running {spec['name']} ({spec['arch']} + {spec['encoder']}) ===")
+            summary = train_and_evaluate_one(cfg, spec, train_pairs_ok, val_pairs_ok, test_pairs_ok, aug_train, aug_val)
+            all_summaries.append(summary)
+            pd.DataFrame(all_summaries).to_csv(Path(cfg.output_root) / "leaderboard_running.csv", index=False)
+        except Exception as e:
+            print(f"[SKIP/ERROR] {spec['name']} -> {repr(e)}")
+            continue
+
+    leader = pd.DataFrame(all_summaries)
+    leader.to_csv(Path(cfg.output_root) / "leaderboard_final.csv", index=False)
+    print("\nDone. Leaderboard saved to:", Path(cfg.output_root) / "leaderboard_final.csv")
+
+    # Cross-model summary plots
+    summary_dir = Path(cfg.output_root) / "__SUMMARY__"
+    plot_model_summary(cfg, leader, summary_dir)
+    leader.to_csv(summary_dir / "leaderboard_final_copy.csv", index=False)
+    print("Summary figures saved to:", summary_dir)
+
+
+if __name__ == "__main__":
+    main()
 
